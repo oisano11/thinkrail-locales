@@ -142,13 +142,17 @@ jobs:
           git commit -m "chore(locales): follow ${{ steps.build.outputs.tag }}"
 
       - name: Publish the catalog
-        if: steps.translate.outputs.changed == 'true'
+        # Also runs on the first pass, when nothing drifted yet: the release is where users download
+        # the file from, so it has to exist before the first new key arrives.
+        if: steps.translate.outputs.changed == 'true' || steps.published.outputs.upstream_tag == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || 'zh-CN' }}"
-          git push
+          if [ "${{ steps.translate.outputs.changed }}" = "true" ]; then
+            git push
+          fi
           notes=$(printf '%s\n' \
             "Language files for ThinkRail, tracking ${{ steps.build.outputs.tag }}." \
             "" \
