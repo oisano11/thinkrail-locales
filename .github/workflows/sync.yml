@@ -1,0 +1,167 @@
+name: Sync the catalogs
+
+# Runs after the app moves, not on a fixed clock: a catalog only needs work when a build changes the
+# English strings. The check is cheap (no API key, no network beyond the download) and exits early
+# when nothing drifted, so an hourly schedule costs one job that mostly does nothing.
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Locale to sync (any tag the app accepts, e.g. zh-CN, ja, pt-BR)"
+        required: false
+        default: zh-CN
+      force:
+        description: "Translate even when nothing drifted"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: sync-catalogs
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # gh infers the repository from the git remote, and this job adds an upstream remote, so pin it.
+  GH_REPO: ${{ github.repository }}
+  UPSTREAM_REPO: JetBrains/thinkrail
+  BUN_VERSION: "1.4.4"
+
+jobs:
+  sync:
+    name: Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Resolve the newest published build
+        id: build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release list --repo "$UPSTREAM_REPO" --limit 40 --json tagName,isPrerelease \
+            --jq '[.[] | select(.isPrerelease)] | .[0].tagName // empty')
+          if [ -z "$tag" ]; then
+            tag=$(gh release list --repo "$UPSTREAM_REPO" --limit 40 --json tagName,isPrerelease \
+              --jq '[.[] | select(.isPrerelease | not)] | .[0].tagName // empty')
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::no upstream release to read a catalog from"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "reading the English catalog from $tag"
+
+      - name: Fetch the English catalog that build ships
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${{ steps.build.outputs.tag }}/packages/locales/en.json" \
+            -o "$RUNNER_TEMP/en.json"
+          bun -e '
+            const en = await Bun.file(process.env.RUNNER_TEMP + "/en.json").json();
+            const keys = Object.keys(en);
+            if (keys.length === 0) throw new Error("empty catalog");
+            console.log(`en.json: ${keys.length} keys`);
+          '
+
+      - name: Read the published state of this catalog
+        id: published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || 'zh-CN' }}"
+          body=$(gh release view "catalogs" --json body --jq .body 2>/dev/null || echo "")
+          sha=$(printf '%s\n' "$body" | sed -n 's/^upstream-tag: //p' | tail -n 1)
+          echo "upstream_tag=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether there is work
+        id: decide
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || 'zh-CN' }}"
+          same_tag=false
+          if [ "${{ steps.published.outputs.upstream_tag }}" = "${{ steps.build.outputs.tag }}" ]; then
+            same_tag=true
+          fi
+          if [ "$same_tag" = true ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            if bun scripts/sync-catalog.ts --tag "$tag" --english "$RUNNER_TEMP/en.json" --check > /dev/null 2>&1; then
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::$tag is level with ${{ steps.build.outputs.tag }}; nothing to do"
+              exit 0
+            fi
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Translate what the build added
+        id: translate
+        if: steps.decide.outputs.run == 'true'
+        # A partial catalog is a smaller improvement, not a broken one: the app falls back to English
+        # for whatever is still missing, so a translation failure must not lose the commit below.
+        continue-on-error: true
+        env:
+          THINKRAIL_CATALOG_API_KEY: ${{ secrets.CATALOG_API_KEY }}
+          THINKRAIL_CATALOG_API_BASE: ${{ vars.CATALOG_API_BASE }}
+          THINKRAIL_CATALOG_MODEL: ${{ vars.CATALOG_MODEL }}
+        run: |
+          set -uo pipefail
+          tag="${{ github.event.inputs.tag || 'zh-CN' }}"
+          if [ -z "${THINKRAIL_CATALOG_API_KEY:-}" ]; then
+            echo "::warning::CATALOG_API_KEY is not set; the catalog keeps English for new keys"
+          fi
+          bun scripts/sync-catalog.ts --tag "$tag" --english "$RUNNER_TEMP/en.json" || {
+            echo "::warning::sync-catalog did not finish; the catalog keeps English for the keys it missed"
+          }
+          if git diff --quiet -- "locales/$tag.json"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager diff --stat -- "locales/$tag.json"
+          fi
+
+      - name: Commit the new translations
+        if: steps.translate.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || 'zh-CN' }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "locales/$tag.json"
+          git commit -m "chore(locales): follow ${{ steps.build.outputs.tag }}"
+
+      - name: Publish the catalog
+        # Also runs when only the recorded tag moved: the release body carries `upstream-tag`, which is
+        # what lets the next run skip early, so it has to name the build the file was checked against.
+        if: steps.translate.outputs.changed == 'true' || steps.published.outputs.upstream_tag != steps.build.outputs.tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || 'zh-CN' }}"
+          if [ "${{ steps.translate.outputs.changed }}" = "true" ]; then
+            git push
+          fi
+          notes=$(printf '%s\n' \
+            "Language files for ThinkRail, tracking ${{ steps.build.outputs.tag }}." \
+            "" \
+            "Drop \`$tag.json\` into \`~/.thinkrail/locales/\` and pick it in Settings → Language." \
+            "" \
+            "upstream-tag: ${{ steps.build.outputs.tag }}")
+          if gh release view catalogs > /dev/null 2>&1; then
+            gh release edit catalogs --notes "$notes"
+          else
+            gh release create catalogs --title "Language files" --notes "$notes"
+          fi
+          gh release upload catalogs "locales/$tag.json" --clobber
