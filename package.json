@@ -1,0 +1,9 @@
+{
+  "name": "thinkrail-locales",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "check": "bun test && bun scripts/sync-catalog.ts --tag zh-CN --english ${THINKRAIL_ENGLISH:-/tmp/en.json} --check"
+  }
+}
